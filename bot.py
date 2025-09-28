@@ -1,9 +1,14 @@
-import sys; sys.modules["audioop"] = None  # avoid audioop import on slim runtimes
+# --- hard-fix for missing/poisoned audioop on slim runtimes ---
+import sys, types
+if sys.modules.get("audioop") is None:  # remove poisoned entry
+    del sys.modules["audioop"]
+if "audioop" not in sys.modules:        # install a tiny stub module
+    sys.modules["audioop"] = types.ModuleType("audioop")
+# ---------------------------------------------------------------
 import os, json, logging, datetime, asyncio
 from typing import Optional, Tuple
 
-import sys, types
-sys.modules["audioop"] = types.ModuleType("audioop")  # stub so import succeeds
+
 import discord
 from discord import app_commands
 from discord.ext import commands
