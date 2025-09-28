@@ -1,10 +1,11 @@
+import sys; sys.modules["audioop"] = None  # avoid audioop import on slim runtimes
 import os, json, logging, datetime, asyncio
 from typing import Optional, Tuple
 
 import discord
 from discord import app_commands
 from discord.ext import commands
-from aiohttp import web  # health server
+from aiohttp import web  # for Render Web health check
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("theovsvrose")
@@ -13,13 +14,13 @@ log = logging.getLogger("theovsvrose")
 TOKEN = os.getenv("DISCORD_TOKEN")
 GUILD_ID = os.getenv("GUILD_ID")
 ANNOUNCE_CHANNEL_ID = os.getenv("BOT_ANNOUNCE_CHANNEL_ID")
-STORAGE_CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID")  # ID of a channel where the bot can pin/edit stats
+STORAGE_CHANNEL_ID = os.getenv("STORAGE_CHANNEL_ID")  # numeric channel ID
 
 # ---- Game constants ----
 EMOJI_TO_PLAYER = {"🕷": "Theo", "🌹": "Rose"}
 ROUND_LIMIT = 12
 TIEBREAKER_ROUND = 13
-STORE_MARKER = "[TVR-DATA-V1]"
+STORE_MARKER = "[TVR-DATA-V2]"  # bump version to migrate from old format
 
 # ---- Intents ----
 intents = discord.Intents.default()
@@ -31,30 +32,84 @@ intents.messages = True
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ===================== Storage via pinned Discord message =====================
+# ===================== Storage via pinned Discord message (compact) =====================
+# Compact schema saved to Discord message (single line, small keys):
+# {"s":{"gid":1,"r":0,"tp":0,"rp":0,"tb":false,"a":true,"ro":false,"rm":null},
+#  "lt":{"Theo":{"p":0,"w":0},"Rose":{"p":0,"w":0}}}
+#
+# Internal (expanded) schema we use in code:
+# state: {game_id, round, theo_points, rose_points, tiebreaker, active, round_open, round_message_id}
+# lifetime: {Theo:{points,wins}, Rose:{points,wins}}
+
+def default_internal():
+    return {
+        "state": {
+            "game_id": 1, "round": 0, "theo_points": 0, "rose_points": 0,
+            "tiebreaker": False, "active": True, "round_open": False, "round_message_id": None
+        },
+        "lifetime": {"Theo": {"points": 0, "wins": 0}, "Rose": {"points": 0, "wins": 0}},
+    }
+
+def to_compact(internal: dict) -> dict:
+    st = internal["state"]
+    lt = internal["lifetime"]
+    return {
+        "s": {
+            "gid": st["game_id"], "r": st["round"], "tp": st["theo_points"], "rp": st["rose_points"],
+            "tb": st["tiebreaker"], "a": st["active"], "ro": st["round_open"], "rm": st["round_message_id"],
+        },
+        "lt": {
+            "Theo": {"p": lt.get("Theo", {}).get("points", 0), "w": lt.get("Theo", {}).get("wins", 0)},
+            "Rose": {"p": lt.get("Rose", {}).get("points", 0), "w": lt.get("Rose", {}).get("wins", 0)},
+        },
+    }
+
+def to_internal(compact: dict) -> dict:
+    # accept either compact or previous expanded formats
+    if "s" in compact and "lt" in compact:  # compact
+        s = compact["s"]; lt = compact["lt"]
+        return {
+            "state": {
+                "game_id": s.get("gid", 1), "round": s.get("r", 0),
+                "theo_points": s.get("tp", 0), "rose_points": s.get("rp", 0),
+                "tiebreaker": s.get("tb", False), "active": s.get("a", True),
+                "round_open": s.get("ro", False), "round_message_id": s.get("rm", None),
+            },
+            "lifetime": {
+                "Theo": {"points": lt.get("Theo", {}).get("p", 0), "wins": lt.get("Theo", {}).get("w", 0)},
+                "Rose": {"points": lt.get("Rose", {}).get("p", 0), "wins": lt.get("Rose", {}).get("w", 0)},
+            },
+        }
+    # fallback: expanded (V1)
+    d = default_internal()
+    try:
+        st = compact.get("state", {})
+        d["state"].update({
+            "game_id": st.get("game_id", 1), "round": st.get("round", 0),
+            "theo_points": st.get("theo_points", 0), "rose_points": st.get("rose_points", 0),
+            "tiebreaker": st.get("tiebreaker", False), "active": st.get("active", True),
+            "round_open": st.get("round_open", False), "round_message_id": st.get("round_message_id", None),
+        })
+        lt = compact.get("lifetime", {})
+        d["lifetime"]["Theo"]["points"] = lt.get("Theo", {}).get("points", 0)
+        d["lifetime"]["Theo"]["wins"]   = lt.get("Theo", {}).get("wins", 0)
+        d["lifetime"]["Rose"]["points"] = lt.get("Rose", {}).get("points", 0)
+        d["lifetime"]["Rose"]["wins"]   = lt.get("Rose", {}).get("wins", 0)
+    except Exception:
+        pass
+    return d
+
 class MessageStore:
     def __init__(self):
         self.channel_id: Optional[int] = int(STORAGE_CHANNEL_ID) if STORAGE_CHANNEL_ID else None
         self.message_id: Optional[int] = None
         self.cache = None
 
-    @staticmethod
-    def default_data():
-        return {
-            "state": {
-                "game_id": 1, "round": 0, "theo_points": 0, "rose_points": 0,
-                "tiebreaker": False, "active": True, "round_open": False, "round_message_id": None
-            },
-            "log": [],
-            "lifetime": {"Theo": {"points": 0, "wins": 0}, "Rose": {"points": 0, "wins": 0}},
-        }
-
     async def ensure_ready(self) -> None:
         if not self.channel_id:
-            raise RuntimeError("Set STORAGE_CHANNEL_ID env var to a channel ID I can pin a message in.")
+            raise RuntimeError("Set STORAGE_CHANNEL_ID to a numeric channel ID.")
         channel = bot.get_channel(self.channel_id) or await bot.fetch_channel(self.channel_id)
-
-        # Try pins first
+        # Look for a pinned message with our marker
         pins = await channel.pins()
         for m in pins:
             if m.author == bot.user and STORE_MARKER in (m.content or ""):
@@ -62,44 +117,47 @@ class MessageStore:
                 self.cache = self._parse(m.content)
                 log.info("Found pinned storage message %s", m.id)
                 return
-
         # Search recent history
         async for m in channel.history(limit=100):
             if m.author == bot.user and STORE_MARKER in (m.content or ""):
-                try:
-                    await m.pin()
-                except Exception:
-                    pass
+                try: await m.pin()
+                except Exception: pass
                 self.message_id = m.id
                 self.cache = self._parse(m.content)
-                log.info("Found storage message in history; pinned %s", m.id)
+                log.info("Found storage in history; pinned %s", m.id)
                 return
-
-        # Create fresh message
-        data = self.default_data()
-        msg = await channel.send(self._render(data))
-        try:
-            await msg.pin()
-        except Exception:
-            pass
+        # Create fresh compact message
+        data = default_internal()
+        content = self._render(data)
+        msg = await channel.send(content)
+        try: await msg.pin()
+        except Exception: pass
         self.message_id = msg.id
         self.cache = data
-        log.info("Created and pinned new storage message %s", msg.id)
+        log.info("Created storage message %s", msg.id)
 
-    @staticmethod
-    def _render(data: dict) -> str:
-        return f"{STORE_MARKER}\n```json\n{json.dumps(data, indent=2)}\n```"
+    def _render(self, internal: dict) -> str:
+        compact = to_compact(internal)
+        # One line; no code block; keep it small
+        payload = json.dumps(compact, separators=(",", ":"))
+        # Include marker so we can find it again
+        content = f"{STORE_MARKER} {payload}"
+        # Safety: ensure under 2000 chars
+        if len(content) > 1900:
+            # If we ever get close (unlikely now), drop any optional bits (none currently)
+            pass
+        return content
 
-    @staticmethod
-    def _parse(content: str) -> dict:
+    def _parse(self, content: str) -> dict:
         try:
-            start = content.index("```json") + len("```json")
-            end = content.rindex("```")
-            js = content[start:end].strip()
-            return json.loads(js)
+            # Expect "[TVR-DATA-V2] {json...}"
+            idx = content.index("{")
+            js = content[idx:]
+            comp = json.loads(js)
+            return to_internal(comp)
         except Exception:
-            log.warning("Failed to parse storage content; using defaults.")
-            return MessageStore.default_data()
+            log.warning("Parse failed; falling back to defaults.")
+            return default_internal()
 
     async def load(self) -> dict:
         if not self.message_id:
@@ -143,16 +201,6 @@ async def set_state(game_id:int, round_no:int, theo:int, rose:int, tiebreaker:bo
     }
     await save_data(d)
 
-async def log_reaction(guild_id, channel_id, message_id, user_id, emoji, player, delta, game_id, round_no):
-    d = await load_data()
-    d["log"].append({
-        "timestamp": datetime.datetime.utcnow().isoformat(),
-        "guild_id": str(guild_id), "channel_id": str(channel_id), "message_id": str(message_id),
-        "user_id": str(user_id), "emoji": emoji, "player": player, "delta": delta,
-        "game_id": game_id, "round": round_no
-    })
-    await save_data(d)
-
 async def update_lifetime(player:str, delta_points:int=0, delta_wins:int=0):
     d = await load_data()
     lt = d["lifetime"]
@@ -190,27 +238,21 @@ async def post_round_prompt(target, round_no:int, tiebreaker:bool=False):
     channel = target.channel if isinstance(target, discord.Interaction) else target
     msg = await channel.send(content)
     try:
-        await msg.add_reaction("🕷")
-        await msg.add_reaction("🌹")
+        await msg.add_reaction("🕷"); await msg.add_reaction("🌹")
     except Exception as e:
         log.error(f"Add reactions failed: {e}")
-    # open this round
     game_id, _, theo, rose, tbreak, active, _, _ = await get_state()
     await set_state(game_id, round_no, theo, rose, tiebreaker, True, True, msg.id)
     return msg
 
 # ---------------- Health server (for Render Web) ----------------
-async def _health(request):
-    return web.Response(text="OK")
-
+async def _health(request): return web.Response(text="OK")
 async def start_web():
     app = web.Application()
     app.add_routes([web.get("/", _health)])
     port = int(os.getenv("PORT", "10000"))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    runner = web.AppRunner(app); await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port); await site.start()
     log.info("Health server listening on %s", port)
 
 # ---------------- Events / errors ----------------
@@ -218,12 +260,9 @@ async def start_web():
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     try:
         text = f"⚠️ Command error: `{type(error).__name__}` — see logs."
-        if interaction.response.is_done():
-            await interaction.followup.send(text, ephemeral=True)
-        else:
-            await interaction.response.send_message(text, ephemeral=True)
-    except Exception:
-        pass
+        if interaction.response.is_done(): await interaction.followup.send(text, ephemeral=True)
+        else: await interaction.response.send_message(text, ephemeral=True)
+    except Exception: pass
     log.exception("Slash command error: %s", error)
 
 @bot.event
@@ -233,8 +272,7 @@ async def on_ready():
             await bot.tree.sync(guild=discord.Object(id=int(GUILD_ID)))
             log.info("Synced commands to guild %s", GUILD_ID)
         else:
-            await bot.tree.sync()
-            log.info("Synced global commands")
+            await bot.tree.sync(); log.info("Synced global commands")
     except Exception as e:
         log.error("Command sync failed: %s", e)
     try:
@@ -268,29 +306,23 @@ async def round(interaction: discord.Interaction):
 @app_commands.guild_only()
 async def score(interaction: discord.Interaction):
     game_id, round_no, theo, rose, tiebreaker, active, _, _ = await get_state()
-    d = await load_data()
-    lt = d["lifetime"]
-    theo_lp = lt.get("Theo", {}).get("points", 0)
-    rose_lp = lt.get("Rose", {}).get("points", 0)
-    theo_lw = lt.get("Theo", {}).get("wins", 0)
-    rose_lw = lt.get("Rose", {}).get("wins", 0)
+    d = await load_data(); lt = d["lifetime"]
     embed = discord.Embed(title="TheoVsRose 🎴 — Score", timestamp=datetime.datetime.utcnow())
     embed.add_field(name="Current Game", value=f"Theo 🕷: **{theo}**\nRose 🌹: **{rose}**\nRounds: **{theo+rose}**", inline=False)
-    embed.add_field(name="Lifetime", value=f"Theo 🕷 — {theo_lp} pts | {theo_lw} wins\nRose 🌹 — {rose_lp} pts | {rose_lw} wins", inline=False)
+    embed.add_field(
+        name="Lifetime",
+        value=f"Theo 🕷 — {lt['Theo']['points']} pts | {lt['Theo']['wins']} wins\n"
+              f"Rose 🌹 — {lt['Rose']['points']} pts | {lt['Rose']['wins']} wins",
+        inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(description="Show lifetime standings")
 @app_commands.guild_only()
 async def leaderboard(interaction: discord.Interaction):
-    d = await load_data()
-    lt = d["lifetime"]
-    theo_lp = lt.get("Theo", {}).get("points", 0)
-    rose_lp = lt.get("Rose", {}).get("points", 0)
-    theo_lw = lt.get("Theo", {}).get("wins", 0)
-    rose_lw = lt.get("Rose", {}).get("wins", 0)
+    d = await load_data(); lt = d["lifetime"]
     embed = discord.Embed(title="TheoVsRose 🎴 — Lifetime Leaderboard", timestamp=datetime.datetime.utcnow())
-    embed.add_field(name="Theo 🕷", value=f"{theo_lp} pts | {theo_lw} wins", inline=True)
-    embed.add_field(name="Rose 🌹", value=f"{rose_lp} pts | {rose_lw} wins", inline=True)
+    embed.add_field(name="Theo 🕷", value=f"{lt['Theo']['points']} pts | {lt['Theo']['wins']} wins", inline=True)
+    embed.add_field(name="Rose 🌹", value=f"{lt['Rose']['points']} pts | {lt['Rose']['wins']} wins", inline=True)
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 @bot.tree.command(description="Show lifetime standings (alias)")
@@ -314,7 +346,7 @@ async def setchannel(interaction: discord.Interaction, channel: discord.TextChan
     ANNOUNCE_CHANNEL_ID = str(channel.id)
     await interaction.response.send_message(f"Announcements will be posted in {channel.mention}.", ephemeral=True)
 
-# ---------------- Reactions (auto-advance) ----------------
+# ---------------- Reactions (auto-advance on first valid reaction) ----------------
 def is_current_round_message(msg: discord.Message, round_open: bool, round_message_id: Optional[int]):
     return round_open and round_message_id and msg.id == round_message_id and msg.author == bot.user
 
@@ -331,44 +363,34 @@ async def after_score_and_flow(channel: discord.TextChannel):
     announce_channel = None
     if ANNOUNCE_CHANNEL_ID:
         ch = channel.guild.get_channel(int(ANNOUNCE_CHANNEL_ID))
-        if ch:
-            announce_channel = ch
-    if not announce_channel:
-        announce_channel = channel
+        if ch: announce_channel = ch
+    if not announce_channel: announce_channel = channel
 
     over, winner, need_tie = is_game_over(theo, rose)
     if need_tie:
         await announce(announce_channel, "🔥 Tie detected! Round 13 — React now to decide the winner! 🔥")
-        await post_round_prompt(announce_channel, TIEBREAKER_ROUND, tiebreaker=True)
-        return
+        await post_round_prompt(announce_channel, TIEBREAKER_ROUND, tiebreaker=True); return
     if over and winner:
         await update_lifetime(winner, delta_points=0, delta_wins=1)
         await announce(announce_channel, f"🏆 **{winner}** wins the game! Final score: Theo {theo} — Rose {rose}")
         await set_state(game_id + 1, 0, 0, 0, False, True, False, None)
-        await post_round_prompt(announce_channel, 1, tiebreaker=False)
-        return
+        await post_round_prompt(announce_channel, 1, tiebreaker=False); return
     next_no = next_round_number(theo, rose)
     await post_round_prompt(announce_channel, next_no, tiebreaker=False)
 
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.User):
     try:
-        if user.bot:
-            return
+        if user.bot: return
         game_id, round_no, theo, rose, tiebreaker, active, round_open, round_msg_id = await get_state()
-        if not is_current_round_message(reaction.message, round_open, round_msg_id):
-            return
+        if not is_current_round_message(reaction.message, round_open, round_msg_id): return
         emoji = str(reaction.emoji)
-        if emoji not in EMOJI_TO_PLAYER:
-            return
+        if emoji not in EMOJI_TO_PLAYER: return
         player = EMOJI_TO_PLAYER[emoji]
-        if player == "Theo":
-            theo += 1
-        else:
-            rose += 1
+        if player == "Theo": theo += 1
+        else: rose += 1
         await update_lifetime(player, delta_points=1, delta_wins=0)
         await set_state(game_id, round_no, theo, rose, tiebreaker, True, False, round_msg_id)
-        await log_reaction(reaction.message.guild.id, reaction.message.channel.id, reaction.message.id, user.id, emoji, player, +1, game_id, round_no)
         await close_round_message(reaction.message)
         await after_score_and_flow(reaction.message.channel)
     except Exception as e:
@@ -383,10 +405,12 @@ if __name__ == "__main__":
     if not TOKEN:
         print("Set DISCORD_TOKEN env var.")
     elif not STORAGE_CHANNEL_ID:
-        print("Set STORAGE_CHANNEL_ID env var (ID of a channel for pinned stats).")
+        print("Set STORAGE_CHANNEL_ID env var (numeric channel ID).")
     else:
         async def main():
-            await start_web()       # start health server for Render Web
-            await bot.start(TOKEN)  # start Discord bot
+            # start the small web server so Render Web stays up
+            await start_web()
+            # start the Discord bot
+            await bot.start(TOKEN)
         asyncio.run(main())
 
