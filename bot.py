@@ -2,6 +2,8 @@ import sys; sys.modules["audioop"] = None  # avoid audioop import on slim runtim
 import os, json, logging, datetime, asyncio
 from typing import Optional, Tuple
 
+import sys, types
+sys.modules["audioop"] = types.ModuleType("audioop")  # stub so import succeeds
 import discord
 from discord import app_commands
 from discord.ext import commands
