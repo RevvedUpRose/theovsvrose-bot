@@ -1,10 +1,14 @@
-# --- hard-fix for missing/poisoned audioop on slim runtimes ---
+# --- robust stub for missing/poisoned audioop on slim runtimes ---
 import sys, types
-if sys.modules.get("audioop") is None:  # remove poisoned entry
+
+# If audioop exists but is poisoned as None, remove it safely
+if "audioop" in sys.modules and sys.modules["audioop"] is None:
     del sys.modules["audioop"]
-if "audioop" not in sys.modules:        # install a tiny stub module
+
+# If audioop not present, install a tiny stub module
+if "audioop" not in sys.modules:
     sys.modules["audioop"] = types.ModuleType("audioop")
-# ---------------------------------------------------------------
+# -----------------------------------------------------------------
 import os, json, logging, datetime, asyncio
 from typing import Optional, Tuple
 
